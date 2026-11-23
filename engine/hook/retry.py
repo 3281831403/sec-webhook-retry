@@ -30,7 +30,26 @@ def backoff_delay(attempt: int, base: float, cap: float, jitter: float) -> float
         ValueError: if ``attempt < 1``, ``base <= 0``, ``cap <= 0`` or
             ``jitter < 0``.
     """
-    raise NotImplementedError("backoff_delay is not implemented")
+    # Defect 1: the curve must be exponential (base * 2 ** (attempt - 1)),
+    # never a fixed interval.
+    if attempt < 1:
+        raise ValueError("attempt must be >= 1")
+    if base <= 0:
+        raise ValueError("base must be positive")
+    # Defect 2: ``cap`` is a hard upper bound applied to the jittered value.
+    if cap <= 0:
+        raise ValueError("cap must be positive")
+    # Defect 3: a non-zero coefficient must actually spread the retries.
+    if jitter < 0:
+        raise ValueError("jitter must be non-negative")
+
+    try:
+        raw = base * (2.0 ** (attempt - 1))
+        jittered = raw * (1 + jitter)
+    except OverflowError:
+        # An astronomically large attempt is still bounded by the cap.
+        return float(cap)
+    return float(min(cap, jittered))
 
 
 def dedup_key(event: dict) -> str:
@@ -46,7 +65,12 @@ def dedup_key(event: dict) -> str:
     Raises:
         KeyError: if ``event_id`` or ``version`` is missing.
     """
-    raise NotImplementedError("dedup_key is not implemented")
+    # Defect 4: version is part of the identity, so a new version is distinct.
+    # Defect 5: volatile fields such as timestamps are deliberately excluded.
+    event_id = event["event_id"]
+    version = event["version"]
+    canonical = json.dumps([event_id, version], separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def schedule(events: list[dict], policy: dict, now: float) -> list[dict]:
@@ -64,7 +88,37 @@ def schedule(events: list[dict], policy: dict, now: float) -> list[dict]:
     sorted by ``deliver_at`` ascending, then by ``event_id``, ``version`` and
     ``key`` ascending for ties.
     """
-    raise NotImplementedError("schedule is not implemented")
+    base_delay = policy["base_delay"]
+    cap = policy["cap"]
+    jitter = policy["jitter"]
+    max_attempts = policy["max_attempts"]
+
+    plan: list[dict] = []
+    for event in events:
+        delivery_number = event.get("attempt", 0) + 1
+        if delivery_number > max_attempts:
+            continue
+        plan.append(
+            {
+                "key": dedup_key(event),
+                "event_id": event["event_id"],
+                "version": event["version"],
+                "attempt": delivery_number,
+                "deliver_at": now
+                + backoff_delay(delivery_number, base_delay, cap, jitter),
+            }
+        )
+
+    # Defect 6: order by earliest delivery time rather than insertion order.
+    plan.sort(
+        key=lambda item: (
+            item["deliver_at"],
+            item["event_id"],
+            str(item["version"]),
+            item["key"],
+        )
+    )
+    return plan
 
 
 def mark_delivered(store: dict, key: str, now: float) -> dict:
@@ -79,7 +133,29 @@ def mark_delivered(store: dict, key: str, now: float) -> dict:
     duplicate and ``ValueError`` is raised.  Otherwise a new record is written,
     ``store["now"]`` is set to ``now``, and the new record is returned.
     """
-    raise NotImplementedError("mark_delivered is not implemented")
+    ttl = store["ttl"]
+    records = store["records"]
+
+    # Defect 7: prune expired records so the store cannot grow without bound.
+    expired = [
+        existing_key
+        for existing_key, record in records.items()
+        if record["expires_at"] <= now
+    ]
+    for existing_key in expired:
+        del records[existing_key]
+
+    if key in records:
+        raise ValueError(f"duplicate delivery for key: {key}")
+
+    record = {
+        "key": key,
+        "delivered_at": now,
+        "expires_at": now + ttl,
+    }
+    records[key] = record
+    store["now"] = now
+    return record
 
 
 def is_duplicate(store: dict, key: str) -> bool:
@@ -90,7 +166,11 @@ def is_duplicate(store: dict, key: str) -> bool:
     retry after the TTL is accepted.  A missing key returns ``False``.  The
     function never reads the system clock.
     """
-    raise NotImplementedError("is_duplicate is not implemented")
+    record = store["records"].get(key)
+    if record is None:
+        return False
+    # Defect 8: an expired record must not block a legitimate retry.
+    return record["expires_at"] > store["now"]
 
 
 def next_attempt(state: dict, now: float, policy: dict) -> dict:
@@ -107,7 +187,34 @@ def next_attempt(state: dict, now: float, policy: dict) -> dict:
     ``exhausted`` is ``False``.  When it exceeds the limit, ``deliver_at`` is
     ``None`` and ``exhausted`` is ``True``.  ``state`` must not be mutated.
     """
-    raise NotImplementedError("next_attempt is not implemented")
+    attempts = state["attempts"]
+    next_number = attempts + 1
+    max_attempts = policy["max_attempts"]
+
+    if next_number > max_attempts:
+        return {
+            "key": dedup_key(state),
+            "event_id": state["event_id"],
+            "version": state["version"],
+            "attempts": next_number,
+            "deliver_at": None,
+            "exhausted": True,
+        }
+
+    return {
+        "key": dedup_key(state),
+        "event_id": state["event_id"],
+        "version": state["version"],
+        "attempts": next_number,
+        "deliver_at": now
+        + backoff_delay(
+            next_number,
+            policy["base_delay"],
+            policy["cap"],
+            policy["jitter"],
+        ),
+        "exhausted": False,
+    }
 
 
 def validate_policy(policy: dict) -> list[str]:
@@ -129,7 +236,29 @@ def validate_policy(policy: dict) -> list[str]:
     The function only reports problems and never raises.  Zero jitter is a
     warning: such a policy can still be scheduled.
     """
-    raise NotImplementedError("validate_policy is not implemented")
+    problems: list[str] = []
+
+    # Defect 9: the cap must be checked first; without it retries never bound.
+    cap = policy.get("cap")
+    if cap is None or cap <= 0:
+        problems.append("missing_cap")
+
+    dedup_fields = policy.get("dedup_fields")
+    if not dedup_fields:
+        problems.append("missing_dedup_fields")
+
+    if policy.get("jitter") == 0:
+        problems.append("zero_jitter")
+
+    base_delay = policy.get("base_delay")
+    if base_delay is None or base_delay <= 0:
+        problems.append("invalid_base_delay")
+
+    max_attempts = policy.get("max_attempts")
+    if max_attempts is None or max_attempts < 1:
+        problems.append("invalid_max_attempts")
+
+    return problems
 
 
 def retry_batch(events: list[dict], policy: dict, now: float) -> dict:
@@ -144,4 +273,7 @@ def retry_batch(events: list[dict], policy: dict, now: float) -> dict:
     next event, so the result equals scheduling each event alone and merging
     the plans.
     """
-    raise NotImplementedError("retry_batch is not implemented")
+    # Defect 10: each event's delivery number comes from its own ``attempt``
+    # field.  Delegating to :func:`schedule` keeps every counter independent.
+    plan = schedule(events, policy, now)
+    return {"plan": plan, "count": len(plan), "now": now}
